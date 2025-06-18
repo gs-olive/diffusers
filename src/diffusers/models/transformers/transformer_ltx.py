@@ -351,29 +351,21 @@ class LTXVideoTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin
         super().__init__()
 
         out_channels = out_channels or in_channels
-        inner_dim = num_attention_heads * attention_head_dim
+        self.inner_dim = num_attention_heads * attention_head_dim
+        self.patch_size = patch_size
+        self.patch_size_t = patch_size_t
 
-        self.proj_in = nn.Linear(in_channels, inner_dim)
+        self.proj_in = nn.Linear(in_channels, self.inner_dim)
 
-        self.scale_shift_table = nn.Parameter(torch.randn(2, inner_dim) / inner_dim**0.5)
-        self.time_embed = AdaLayerNormSingle(inner_dim, use_additional_conditions=False)
+        self.scale_shift_table = nn.Parameter(torch.randn(2, self.inner_dim) / self.inner_dim**0.5)
+        self.time_embed = AdaLayerNormSingle(self.inner_dim, use_additional_conditions=False)
 
-        self.caption_projection = PixArtAlphaTextProjection(in_features=caption_channels, hidden_size=inner_dim)
-
-        self.rope = LTXVideoRotaryPosEmbed(
-            dim=inner_dim,
-            base_num_frames=20,
-            base_height=2048,
-            base_width=2048,
-            patch_size=patch_size,
-            patch_size_t=patch_size_t,
-            theta=10000.0,
-        )
+        self.caption_projection = PixArtAlphaTextProjection(in_features=caption_channels, hidden_size=self.inner_dim)
 
         self.transformer_blocks = nn.ModuleList(
             [
                 LTXVideoTransformerBlock(
-                    dim=inner_dim,
+                    dim=self.inner_dim,
                     num_attention_heads=num_attention_heads,
                     attention_head_dim=attention_head_dim,
                     cross_attention_dim=cross_attention_dim,
@@ -388,8 +380,8 @@ class LTXVideoTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin
             ]
         )
 
-        self.norm_out = nn.LayerNorm(inner_dim, eps=1e-6, elementwise_affine=False)
-        self.proj_out = nn.Linear(inner_dim, out_channels)
+        self.norm_out = nn.LayerNorm(self.inner_dim, eps=1e-6, elementwise_affine=False)
+        self.proj_out = nn.Linear(self.inner_dim, out_channels)
 
         self.gradient_checkpointing = False
 
@@ -399,11 +391,8 @@ class LTXVideoTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin
         encoder_hidden_states: torch.Tensor,
         timestep: torch.LongTensor,
         encoder_attention_mask: torch.Tensor,
-        num_frames: Optional[int] = None,
-        height: Optional[int] = None,
-        width: Optional[int] = None,
-        rope_interpolation_scale: Optional[Union[Tuple[float, float, float], torch.Tensor]] = None,
-        video_coords: Optional[torch.Tensor] = None,
+        image_rotary_emb_cos: Optional[torch.Tensor] = None,
+        image_rotary_emb_sin: Optional[torch.Tensor] = None,
         attention_kwargs: Optional[Dict[str, Any]] = None,
         return_dict: bool = True,
     ) -> torch.Tensor:
@@ -422,7 +411,7 @@ class LTXVideoTransformer3DModel(ModelMixin, ConfigMixin, FromOriginalModelMixin
                     "Passing `scale` via `attention_kwargs` when not using the PEFT backend is ineffective."
                 )
 
-        image_rotary_emb = self.rope(hidden_states, num_frames, height, width, rope_interpolation_scale, video_coords)
+        image_rotary_emb = (image_rotary_emb_cos, image_rotary_emb_sin)
 
         # convert encoder_attention_mask to a bias the same way we do for attention_mask
         if encoder_attention_mask is not None and encoder_attention_mask.ndim == 2:

@@ -593,6 +593,48 @@ class LTXImageToVideoPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLo
     def interrupt(self):
         return self._interrupt
 
+    def generate_video_coords(self, latent_height, latent_width, latent_num_frames, rope_interpolation_scale, device, grid_bs):
+        ##### VIDEO COORDS PRECOMPUTATION #####
+        import math
+        grid_h = torch.arange(latent_height, dtype=torch.float32, device=device)
+        grid_w = torch.arange(latent_width, dtype=torch.float32, device=device)
+        grid_f = torch.arange(latent_num_frames, dtype=torch.float32, device=device)
+        grid = torch.meshgrid(grid_f, grid_h, grid_w, indexing="ij")
+        grid = torch.stack(grid, dim=0)
+        grid = grid.unsqueeze(0).repeat(grid_bs, 1, 1, 1, 1)
+
+        if rope_interpolation_scale is not None:
+            grid[:, 0:1] = grid[:, 0:1] * rope_interpolation_scale[0] * self.transformer.patch_size_t / 20
+            grid[:, 1:2] = grid[:, 1:2] * rope_interpolation_scale[1] * self.transformer.patch_size / 2048
+            grid[:, 2:3] = grid[:, 2:3] * rope_interpolation_scale[2] * self.transformer.patch_size / 2048
+
+        grid = grid.flatten(2, 4).transpose(1, 2)
+
+        start = 1.0
+        end = 10000.0
+        freqs = 10000.0 ** torch.linspace(
+            math.log(start, 10000),
+            math.log(end, 10000.0),
+            self.transformer.inner_dim // 6,
+            device=device,
+            dtype=torch.float32,
+        )
+        freqs = freqs * math.pi / 2.0
+        freqs = freqs * (grid.unsqueeze(-1) * 2 - 1)
+        freqs = freqs.transpose(-1, -2).flatten(2)
+
+        cos_freqs = freqs.cos().repeat_interleave(2, dim=-1)
+        sin_freqs = freqs.sin().repeat_interleave(2, dim=-1)
+
+        if self.transformer.inner_dim % 6 != 0:
+            cos_padding = torch.ones_like(cos_freqs[:, :, : self.transformer.inner_dim % 6])
+            sin_padding = torch.zeros_like(cos_freqs[:, :, : self.transformer.inner_dim % 6])
+            cos_freqs = torch.cat([cos_padding, cos_freqs], dim=-1)
+            sin_freqs = torch.cat([sin_padding, sin_freqs], dim=-1)
+        ##### VIDEO COORDS PRECOMPUTATION #####
+
+        return cos_freqs, sin_freqs
+
     @torch.no_grad()
     @replace_example_docstring(EXAMPLE_DOC_STRING)
     def __call__(
@@ -817,6 +859,9 @@ class LTXImageToVideoPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLo
 
         # 7. Denoising loop
         with self.progress_bar(total=num_inference_steps) as progress_bar:
+            grid_bs = (2*latents.size(0)) if self.do_classifier_free_guidance else latents.size(0)
+            cos_freqs, sin_freqs = self.generate_video_coords(latent_height, latent_width, latent_num_frames, rope_interpolation_scale, device, grid_bs)
+
             for i, t in enumerate(timesteps):
                 if self.interrupt:
                     continue
@@ -835,10 +880,8 @@ class LTXImageToVideoPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLo
                     encoder_hidden_states=prompt_embeds,
                     timestep=timestep,
                     encoder_attention_mask=prompt_attention_mask,
-                    num_frames=latent_num_frames,
-                    height=latent_height,
-                    width=latent_width,
-                    rope_interpolation_scale=rope_interpolation_scale,
+                    image_rotary_emb_cos=cos_freqs,
+                    image_rotary_emb_sin=sin_freqs,
                     attention_kwargs=attention_kwargs,
                     return_dict=False,
                 )[0]
@@ -898,6 +941,7 @@ class LTXImageToVideoPipeline(DiffusionPipeline, FromSingleFileMixin, LTXVideoLo
                 if XLA_AVAILABLE:
                     xm.mark_step()
 
+        del cos_freqs, sin_freqs
         if output_type == "latent":
             video = latents
         else:
